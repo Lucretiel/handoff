@@ -12,4 +12,12 @@ twinsies = "1.1.0"
 
 [dev-dependencies]
 cool_asserts = "2.0.3"
-tokio = { version = "1.25.0", default-features = false, features = ["rt", "test-util", "macros", "rt-multi-thread"] }
+futures = { version = "0.3.25", default-features = false, features = [
+    "executor",
+] }
+tokio = { version = "1.25.0", default-features = false, features = [
+    "rt",
+    "test-util",
+    "macros",
+    "rt-multi-thread",
+] }

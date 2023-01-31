@@ -396,6 +396,8 @@ impl<T> Debug for SendError<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+
     use cool_asserts::assert_matches;
     use futures::StreamExt;
 
@@ -436,6 +438,25 @@ mod tests {
 
         sender_task.await.unwrap();
         receiver_task.await.unwrap();
+    }
+
+    #[test]
+    fn sync_test() {
+        let (mut sender, mut receiver) = channel();
+
+        let sender_thread = thread::spawn(move || {
+            futures::executor::block_on(async move {
+                for i in 0..1_000 {
+                    sender.send(i).await.unwrap();
+                }
+            })
+        });
+
+        for i in 0..1_000 {
+            assert_eq!(futures::executor::block_on(receiver.next()).unwrap(), i);
+        }
+
+        sender_thread.join().unwrap();
     }
 
     #[tokio::test]
