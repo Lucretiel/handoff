@@ -20,7 +20,8 @@ use twinsies::Joint;
 
 use crate::cell::SyncUnsafeCell;
 
-/// Identical to `unreachable_unchecked`, but panics in debug mode. Still requires unsafe.
+/// Identical to `unreachable_unchecked`, but panics in debug mode. Still
+/// requires unsafe.
 macro_rules! debug_unreachable {
     ($($arg:tt)*) => {
         match cfg!(debug_assertions) {
@@ -86,6 +87,11 @@ impl<T> Inner<T> {
                 Err(current) if current == item_pointer.as_ptr() => continue,
 
                 // Receiver owns the value; spin while we wait for it
+                //
+                // TODO: consider using something like the spinner from
+                // parking_lot_core. We're pretty certain that another thread is
+                // working with the pointer, though, so for now we're content to
+                // do a full yield and let it have a chance to finish its work.
                 Err(current) if current.is_null() => thread::yield_now(),
 
                 // Something very wrong happened
@@ -131,7 +137,10 @@ impl<T> Sender<T> {
 
         unsafe impl<T: Send> Send for SendFut<'_, T> {}
 
-        // TODO: verify that this is sound. I'm pretty sure it is, though.
+        // TODO: verify that this is sound. I believe it is in all practical
+        // cases, since there isn't actually any uncontrolled mechanism in this
+        // crate by which a reference to `item` might be used while it's owned
+        // by the channel
         unsafe impl<T> Sync for SendFut<'_, T> {}
 
         impl<T> Future for SendFut<'_, T> {
@@ -155,8 +164,8 @@ impl<T> Sender<T> {
                     )
                 };
 
-                // If we're waiting for the item to be taken, we need to first
-                // see if it's been taken.
+                // If we've published the item pointer for the receiver to take,
+                // check to see if it successfully took the item.
                 if self.waiting {
                     // If we've previously polled, we're aiming to check and
                     // see if the item has been taken by the receiver yet. We
@@ -418,6 +427,19 @@ mod tests {
         sender_task.await.unwrap();
 
         assert_eq!(data, [1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn taskless() {
+        let (mut sender, mut receiver) = channel();
+
+        let (send, recv) = futures::future::join(sender.send(1), receiver.next()).await;
+        send.unwrap();
+        assert_eq!(recv.unwrap(), 1);
+
+        let (recv, send) = futures::future::join(receiver.next(), sender.send(2)).await;
+        send.unwrap();
+        assert_eq!(recv.unwrap(), 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
