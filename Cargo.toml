@@ -7,6 +7,5 @@ edition = "2021"
 
 [dependencies]
 futures = { version = "0.3.25", default-features = false }
-parking_lot_core = "0.9.6"
 thiserror = { version = "1.0.38", default-features = false }
 twinsies = "1.1.0"
