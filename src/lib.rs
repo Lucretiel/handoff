@@ -120,19 +120,26 @@ pub struct Sender<T> {
 
 impl<T> Sender<T> {
     pub async fn send(&mut self, item: T) -> Result<(), SendError<T>> {
+        // Implementation note: it's not clear to me if there's *any* sound way
+        // for a custom struct to reliably give out pointers to its contents,
+        // even if it's pinned and uses `UnsafeCell`. The trouble is that `&mut
+        // UnsafeCell` (and, therefore, `Pin<&mut UnsafeCell>`) still presume
+        // unique access to their contents. We therefore use an `async fn` to
+        // create a pinned value, here, and use `SendFut` to borrow it
+        // immutably.
         let item = SyncUnsafeCell::new(Some(item));
 
         struct SendFut<'a, T> {
             item: &'a SyncUnsafeCell<Option<T>>,
 
             // We don't want to hold a `JointLock` on the Inner<T>; we want to
-            // check each time we're polled if there was a disconnect
+            // check each time we're polled if there was a disconnect.
             inner: &'a Joint<Inner<T>>,
 
-            // If waiting is true, it means that `Inner` has ownership of `item`
+            // If item_lent is true, it means that `Inner` has ownership of `item`
             // and we need to re-acquire the pointer before doing anything with
             // it.
-            waiting: bool,
+            item_lent: bool,
         }
 
         unsafe impl<T: Send> Send for SendFut<'_, T> {}
@@ -166,21 +173,20 @@ impl<T> Sender<T> {
 
                 // If we've published the item pointer for the receiver to take,
                 // check to see if it successfully took the item.
-                if self.waiting {
-                    // If we've previously polled, we're aiming to check and
-                    // see if the item has been taken by the receiver yet. We
-                    // need to first take the `item` pointer, to ensure we
-                    // have exclusive access to the item
+                if self.item_lent {
+                    // If we've previously polled, we're aiming to check and see
+                    // if the item has been taken by the receiver yet. We need
+                    // to first take the `item` pointer, to ensure we have
+                    // exclusive access to the item
                     lock.reclaim_sent_item_pointer(item_pointer);
 
+                    // For consistency, we always update this field after
+                    // reclaiming the pointer.
+                    self.item_lent = false;
+
                     // We've acquired exclusive access to the item pointer; we
-                    // can check to see if the item was taken yet
+                    // can check to see if the item was taken yet.
                     if unsafe { item_pointer.as_ref() }.is_none() {
-                        // The item was taken! We can get on with our lives. We
-                        // do need to reset the `waiting` flag, so that `Drop`
-                        // knows it doesn't need to re-acquire the pointer from
-                        // `Inner`.
-                        self.waiting = false;
                         return Poll::Ready(Ok(()));
                     }
                 }
@@ -202,9 +208,12 @@ impl<T> Sender<T> {
                     unsafe { item_pointer.as_ref() }.is_some(),
                     "Don't poll futures after they returned success"
                 );
+                // TODO: we technically only need a Release write the *first*
+                // time the item is stored, I think. It's likely that this won't
+                // make any practical performance difference, though.
                 lock.sent_item.store(item_pointer.as_ptr(), Release);
                 lock.receiver_waker.wake();
-                self.waiting = true;
+                self.item_lent = true;
 
                 Poll::Pending
             }
@@ -212,13 +221,15 @@ impl<T> Sender<T> {
 
         impl<T> Drop for SendFut<'_, T> {
             fn drop(&mut self) {
-                // If we've never been polled before, we definitely don't need
-                // to do anything extra to drop
-                if !self.waiting {
+                // We only need to do extra drop work if `Inner` has exclusive
+                // access to our `item`.
+                if !self.item_lent {
                     return;
                 };
 
-                // If we disconnected, there's nothing else we need to do
+                // If we disconnected, there's nothing else we need to do. Even
+                // if `item_lent` was true, `inner` was dropped and implicitly
+                // doesn't have access to the `item` anymore.
                 let Some(lock) = self.inner.lock() else { return };
 
                 // When an individual send future drops, we can immediately
@@ -235,10 +246,11 @@ impl<T> Sender<T> {
                 // anything else. The drop can proceed normally.
             }
         }
+
         SendFut {
             item: &item,
             inner: &self.inner,
-            waiting: false,
+            item_lent: false,
         }
         .await
     }
@@ -272,26 +284,6 @@ impl<T> Receiver<T> {
 
 unsafe impl<T: Send> Send for Receiver<T> {}
 
-pub struct Recv<'a, T> {
-    receiver: &'a mut Receiver<T>,
-}
-
-impl<T> Future for Recv<'_, T> {
-    type Output = Option<T>;
-
-    #[inline]
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.receiver.poll_next_unpin(cx)
-    }
-}
-
-impl<T> Drop for Recv<'_, T> {
-    fn drop(&mut self) {
-        let Some(lock) = self.receiver.inner.lock() else { return };
-        drop(lock.receiver_waker.take())
-    }
-}
-
 impl<T> Debug for Receiver<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Receiver")
@@ -317,7 +309,8 @@ impl<T> Stream for Receiver<T> {
         loop {
             // Acquire the pointer. As long as we have it, we have exclusive
             // access to the item. The sender will wait for us to return the
-            // pointer before dropping.
+            // pointer before dropping (or, if it leaks, the value is pinned, so
+            // the pointer is valid forever in that case).
             let sent_item_ptr = lock.sent_item.swap(ptr::null_mut(), Acquire);
 
             // If there wasn't a pointer available, we've already registered
@@ -389,6 +382,36 @@ impl<T> FusedStream for Receiver<T> {
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         let Some(lock) = self.inner.lock() else { return };
+        drop(lock.receiver_waker.take())
+    }
+}
+
+/// Future type for the [`Receiver::recv`] operation. See its documentation for
+/// details.
+pub struct Recv<'a, T> {
+    receiver: &'a mut Receiver<T>,
+}
+
+impl<T> Debug for Recv<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Recv")
+            .field("receiver", &self.receiver)
+            .finish()
+    }
+}
+
+impl<T> Future for Recv<'_, T> {
+    type Output = Option<T>;
+
+    #[inline]
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.receiver.poll_next_unpin(cx)
+    }
+}
+
+impl<T> Drop for Recv<'_, T> {
+    fn drop(&mut self) {
+        let Some(lock) = self.receiver.inner.lock() else { return };
         drop(lock.receiver_waker.take())
     }
 }
@@ -543,4 +566,6 @@ mod tests {
     }
 
     // TODO: test sender leak
+
+    // TODO: bench compare various channels
 }
