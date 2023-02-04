@@ -1,9 +1,23 @@
-mod cell;
+//! `handoff` is a single-producer / single-consumer, unbuffered, asynchronous
+//! channel. It's intended for cases where you want blocking communication
+//! between two async components, where all sends block until the receiver
+//! receives the item.
+//!
+//! A new channel is created with [`channel`], which returns a [`Sender`] and
+//! [`Receiver`]. Items can be sent into the channel with [`Sender::send`], and
+//! received with [`Receiver::recv`]. [`Receiver`] also implements
+//! [`futures::Stream`]. Either end of the channel can be dropped, which will
+//! cause the other end to unblock and report channel disconnection.
+
+#![deny(missing_docs)]
+#![deny(missing_debug_implementations)]
 
 use std::{
+    cell::UnsafeCell,
     fmt::Debug,
     future::Future,
     hint::unreachable_unchecked,
+    ops::Not,
     pin::Pin,
     ptr::{self, NonNull},
     sync::atomic::{
@@ -14,11 +28,24 @@ use std::{
     thread,
 };
 
-use futures::{stream::FusedStream, task::AtomicWaker, Stream, StreamExt};
+trait UnsafeCellExt<T> {
+    #[must_use]
+    fn get_non_null(&self) -> NonNull<T>;
+}
+
+impl<T> UnsafeCellExt<T> for UnsafeCell<T> {
+    #[inline]
+    #[must_use]
+    fn get_non_null(&self) -> NonNull<T> {
+        NonNull::new(self.get()).expect("UnsafeCell shouldn't return a null pointer")
+    }
+}
+
+use ::futures::{stream::FusedStream, task::AtomicWaker, Stream, StreamExt};
+use pin_project::{pin_project, pinned_drop};
+use pinned_aliasable::Aliasable;
 use thiserror::Error;
 use twinsies::Joint;
-
-use crate::cell::SyncUnsafeCell;
 
 /// Identical to `unreachable_unchecked`, but panics in debug mode. Still
 /// requires unsafe.
@@ -42,6 +69,10 @@ macro_rules! when {
     };
 }
 
+/// Create an unbuffered channel for communicating between a pair of
+/// asynchronous components. All sends over this channel will block until the
+/// receiver receives the sent item. See [crate documentation][crate] for
+/// details.
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let (send_joint, recv_joint) = Joint::new(Inner {
         sent_item: AtomicPtr::default(),
@@ -107,6 +138,9 @@ impl<T> Inner<T> {
     }
 }
 
+/// Whenever `Inner` drops, it means a disconnect is happening. Inform the
+/// sender and receiver (though one of them, of course, is being dropped
+/// anyway). It's guaranteed that, once `Inner::drop` is called, the `Joint`
 impl<T> Drop for Inner<T> {
     fn drop(&mut self) {
         self.sender_waker.wake();
@@ -114,146 +148,34 @@ impl<T> Drop for Inner<T> {
     }
 }
 
+/// The sending end of a handoff channel.
+///
+/// This object is created by the [`channel`] function. See [crate
+/// documentation][crate] for details.
 pub struct Sender<T> {
     inner: Joint<Inner<T>>,
 }
 
 impl<T> Sender<T> {
-    pub async fn send(&mut self, item: T) -> Result<(), SendError<T>> {
-        // Implementation note: it's not clear to me if there's *any* sound way
-        // for a custom struct to reliably give out pointers to its contents,
-        // even if it's pinned and uses `UnsafeCell`. The trouble is that `&mut
-        // UnsafeCell` (and, therefore, `Pin<&mut UnsafeCell>`) still presume
-        // unique access to their contents. We therefore use an `async fn` to
-        // create a pinned value, here, and use `SendFut` to borrow it
-        // immutably.
-        let item = SyncUnsafeCell::new(Some(item));
-
-        struct SendFut<'a, T> {
-            item: &'a SyncUnsafeCell<Option<T>>,
-
-            // We don't want to hold a `JointLock` on the Inner<T>; we want to
-            // check each time we're polled if there was a disconnect.
-            inner: &'a Joint<Inner<T>>,
-
-            // If item_lent is true, it means that `Inner` has ownership of `item`
-            // and we need to re-acquire the pointer before doing anything with
-            // it.
-            item_lent: bool,
-        }
-
-        unsafe impl<T: Send> Send for SendFut<'_, T> {}
-
-        // TODO: verify that this is sound. I believe it is in all practical
-        // cases, since there isn't actually any uncontrolled mechanism in this
-        // crate by which a reference to `item` might be used while it's owned
-        // by the channel
-        unsafe impl<T> Sync for SendFut<'_, T> {}
-
-        impl<T> Future for SendFut<'_, T> {
-            type Output = Result<(), SendError<T>>;
-
-            #[inline]
-            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-                let mut item_pointer = self.item.get();
-
-                let Some(lock) = self.inner.lock() else {
-                    return Poll::Ready(
-                        // Safety: if we couldn't acquire a lock, it means that
-                        // the `Inner` dropped, which means we definitely have
-                        // exclusive access to the value.
-                        match unsafe { item_pointer.as_mut() }
-                            .take()
-                        {
-                            Some(item) => Err(SendError(item)),
-                            None => Ok(()),
-                        },
-                    )
-                };
-
-                // If we've published the item pointer for the receiver to take,
-                // check to see if it successfully took the item.
-                if self.item_lent {
-                    // If we've previously polled, we're aiming to check and see
-                    // if the item has been taken by the receiver yet. We need
-                    // to first take the `item` pointer, to ensure we have
-                    // exclusive access to the item
-                    lock.reclaim_sent_item_pointer(item_pointer);
-
-                    // For consistency, we always update this field after
-                    // reclaiming the pointer.
-                    self.item_lent = false;
-
-                    // We've acquired exclusive access to the item pointer; we
-                    // can check to see if the item was taken yet.
-                    if unsafe { item_pointer.as_ref() }.is_none() {
-                        return Poll::Ready(Ok(()));
-                    }
-                }
-
-                // At this point, we've either never been polled before, or
-                // we have been polled previously but we still have the item.
-                // The state is the same either way: the `Inner` contains a
-                // null pointer and we need to notify the receiver that a value
-                // is ready.
-                //
-                // Theoretically, the inner pointer could be non-null, but this
-                // only happens if we leaked a `send` future, so we can just
-                // clobber it. Similarly, we can theoretically not have the
-                // item, if we're polled again after returning Ready. Neither
-                // of these cause unsoundness.
-
-                lock.sender_waker.register(cx.waker());
-                debug_assert!(
-                    unsafe { item_pointer.as_ref() }.is_some(),
-                    "Don't poll futures after they returned success"
-                );
-                // TODO: we technically only need a Release write the *first*
-                // time the item is stored, I think. It's likely that this won't
-                // make any practical performance difference, though.
-                lock.sent_item.store(item_pointer.as_ptr(), Release);
-                lock.receiver_waker.wake();
-                self.item_lent = true;
-
-                Poll::Pending
-            }
-        }
-
-        impl<T> Drop for SendFut<'_, T> {
-            fn drop(&mut self) {
-                // We only need to do extra drop work if `Inner` has exclusive
-                // access to our `item`.
-                if !self.item_lent {
-                    return;
-                };
-
-                // If we disconnected, there's nothing else we need to do. Even
-                // if `item_lent` was true, `inner` was dropped and implicitly
-                // doesn't have access to the `item` anymore.
-                let Some(lock) = self.inner.lock() else { return };
-
-                // When an individual send future drops, we can immediately
-                // erase the waker. No send notification are necessary until a
-                // new send future appears.
-                drop(lock.sender_waker.take());
-
-                // Okay, we need to acquire the pointer before we can drop. This
-                // might involve spinning if the receiver is working with it
-                // right now.
-                let item_pointer = self.item.get();
-                lock.reclaim_sent_item_pointer(item_pointer);
-                // Now that we've reclaimed the pointer, we don't need to do
-                // anything else. The drop can proceed normally.
-            }
-        }
-
+    /// Asynchronously send an item to the receiver. This method will
+    /// asynchronously block until the receiver has received the item. If the
+    /// receiver has been dropped, or drops while the sender is trying to send,
+    /// this will return a [`SendError`] containing the item that failed to
+    /// send.
+    #[inline]
+    #[must_use]
+    pub fn send(&mut self, item: T) -> SendFut<'_, T> {
         SendFut {
-            item: &item,
+            item: Aliasable::new(UnsafeCell::new(Some(item))),
             inner: &self.inner,
             item_lent: false,
         }
-        .await
     }
+
+    // TODO: `Sink` implementation. This will require wrapping the sender. Need
+    // to decide if we prefer a by-move or by-ref sink (probably the latter).
+    // Alternatively, create a crate with a general-purpose adapter between
+    // `async fn send` and `Sink`.
 }
 
 impl<T> Debug for Sender<T> {
@@ -265,20 +187,168 @@ impl<T> Debug for Sender<T> {
 }
 
 unsafe impl<T: Send> Send for Sender<T> {}
-// Theoretically we should `impl Drop for Sender`, to clear the waker. However,
-// we assume that each individual `Send` future will clear wakers when they
-// drop, so (assuming no leaks) the Sender itself never needs to worry about
-// this.
 
+/// Future for sending a single item through a [`Sender`], created by the
+/// [`send`][Sender::send] method. See its documentation for details.
+#[pin_project(PinnedDrop)]
+pub struct SendFut<'a, T> {
+    // Implementation note: It is critically important to remember that the
+    // contents of the cell here can be aliased even when we have a reference
+    // to it, so long as it's pinned. See the `Aliasable` docs for details.
+    #[pin]
+    item: Aliasable<UnsafeCell<Option<T>>>,
+
+    // We don't want to hold a `JointLock` on the Inner<T>; we want to
+    // check each time we're polled if there was a disconnect.
+    inner: &'a Joint<Inner<T>>,
+
+    // If item_lent is true, it means that `Inner` has ownership of `item`
+    // and we need to re-acquire the pointer before doing anything with
+    // it.
+    item_lent: bool,
+}
+
+impl<T> Debug for SendFut<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SendFut")
+            .field("item", &"<in transit>")
+            .field("inner", &self.inner)
+            .field("item_lent", &self.item_lent)
+            .finish()
+    }
+}
+
+impl<T> Future for SendFut<'_, T> {
+    type Output = Result<(), SendError<T>>;
+
+    #[inline]
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+
+        let mut item_pointer = this.item.as_ref().get().get_non_null();
+
+        let Some(lock) = this.inner.lock() else {
+            return Poll::Ready(
+                // Safety: if we couldn't acquire a lock, it means that the
+                // `Inner` dropped, which means we definitely have exclusive
+                // access to the value.
+                match unsafe { item_pointer.as_mut() }
+                    .take()
+                {
+                    Some(item) => Err(SendError(item)),
+                    None => Ok(()),
+                },
+            )
+        };
+
+        // If we've published the item pointer for the receiver to take, check
+        // to see if it successfully took the item.
+        if *this.item_lent {
+            // If we've previously polled, we're aiming to check and see if the
+            // item has been taken by the receiver yet. We need to first take
+            // the `item` pointer, to ensure we have exclusive access to the
+            // item
+            lock.reclaim_sent_item_pointer(item_pointer);
+
+            // For consistency, we always update this field after reclaiming the
+            // pointer. We specifically want it to be false so that our
+            // destructor knows it doesn't need to do any additional work.
+            *this.item_lent = false;
+
+            // We've acquired exclusive access to the item pointer; we can check
+            // to see if the item was taken yet.
+            if unsafe { item_pointer.as_ref() }.is_none() {
+                return Poll::Ready(Ok(()));
+            }
+        }
+
+        // At this point, we've either never been polled before, or we have been
+        // polled previously but we still have the item. The state is the same
+        // either way: the `Inner` contains a null pointer and we need to notify
+        // the receiver that a value is ready.
+        //
+        // Theoretically, the inner pointer could be non-null, but this only
+        // happens if we leaked a `send` future, so we can just clobber it.
+        // Similarly, we can theoretically not have the item, if we're polled
+        // again after returning Ready. Neither of these cause unsoundness.
+
+        lock.sender_waker.register(cx.waker());
+        debug_assert!(
+            unsafe { item_pointer.as_ref() }.is_some(),
+            "Don't poll futures after they returned success"
+        );
+        // TODO: we technically only need a Release write the *first* time the
+        // item is stored, I think. It's likely that this won't make any
+        // practical performance difference, though.
+        lock.sent_item.store(item_pointer.as_ptr(), Release);
+        lock.receiver_waker.wake();
+        *this.item_lent = true;
+
+        Poll::Pending
+    }
+}
+
+#[pinned_drop]
+impl<T> PinnedDrop for SendFut<'_, T> {
+    fn drop(self: Pin<&mut Self>) {
+        let this = self.project();
+
+        // We only need to do extra drop work if `Inner` has exclusive access to
+        // our `item`.
+        if this.item_lent.not() {
+            return;
+        };
+
+        // If we disconnected, there's nothing else we need to do. Even if
+        // `item_lent` was true, `inner` was dropped and implicitly doesn't have
+        // access to the `item` anymore.
+        let Some(lock) = this.inner.lock() else {
+            return;
+        };
+
+        // When an individual send future drops, we can immediately
+        // erase the waker. No send notification are necessary until a
+        // new send future appears.
+        drop(lock.sender_waker.take());
+
+        // Okay, we need to acquire the pointer before we can drop. This
+        // might involve spinning if the receiver is working with it
+        // right now.
+        let item_pointer = this.item.into_ref().get().get_non_null();
+        lock.reclaim_sent_item_pointer(item_pointer);
+        // Now that we've reclaimed the pointer, we don't need to do
+        // anything else. The drop can proceed normally.
+    }
+}
+
+unsafe impl<T: Send> Send for SendFut<'_, T> {}
+
+// TODO: verify that this is sound. I believe it is in all practical
+// cases, since there isn't actually any uncontrolled mechanism in this
+// crate by which a reference to `item` might be used while it's owned
+// by the channel
+unsafe impl<T> Sync for SendFut<'_, T> {}
+
+/// The receiving end of a handoff channel.
+///
+/// This object is created by the [`channel`] function. See [crate
+/// documentation][crate] for details.
+///
+/// [`Receiver`] only provides a simple [`recv`][Receiver::recv] method on its
+/// own, but it also implements [`futures::StreamExt`], which provides a number
+/// of additional helpful iterator-like methods.
 pub struct Receiver<T> {
     inner: Joint<Inner<T>>,
 }
 
 impl<T> Receiver<T> {
+    /// Attempt to receive the next item from the sender.
+    ///
+    /// This method will block until the sender sends an item, or until it
+    /// drops.
     #[inline]
-    #[must_use]
-    pub fn recv(&mut self) -> Recv<'_, T> {
-        Recv { receiver: self }
+    pub fn recv(&mut self) -> RecvFut<'_, T> {
+        RecvFut { receiver: self }
     }
 }
 
@@ -298,24 +368,23 @@ impl<T> Stream for Receiver<T> {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let Some(lock) = self.inner.lock() else { return Poll::Ready(None) };
 
-        // Theoretically, if a value is available, we don't need to register
-        // the waker. However, the waker must be registered *before* the load
-        // if there's no value, or else there's a race where we load a null,
-        // then the sender stores + wakes before our waker is registered. In
-        // the future we might optimize this a bit, to only store when it's
-        // likely to be null (roughly every other call to poll_next).
-        lock.receiver_waker.register(cx.waker());
+        // All of the logic for actually attempting to take an item from
+        // `inner`. We have to call this twice, because we first try to take an
+        // item, then register a waker, then we have to try again after
+        // registering the waker. This avoids a race where we fail to retrieve
+        // and item, then the sender places an item, then the sender calls
+        // wake() before we've registered our waker.
 
-        loop {
+        let try_recv = || loop {
             // Acquire the pointer. As long as we have it, we have exclusive
             // access to the item. The sender will wait for us to return the
             // pointer before dropping (or, if it leaks, the value is pinned, so
             // the pointer is valid forever in that case).
             let sent_item_ptr = lock.sent_item.swap(ptr::null_mut(), Acquire);
 
-            // If there wasn't a pointer available, we've already registered
-            // our waker, so at this point we're waiting for a signal to try
-            // another receive operation.
+            // If there wasn't a pointer available, we've already registered our
+            // waker, so at this point we're waiting for a signal to try another
+            // receive operation.
             let Some(mut sent_item_ptr) = NonNull::new(sent_item_ptr) else {
                 return Poll::Pending
             };
@@ -352,10 +421,8 @@ impl<T> Stream for Receiver<T> {
                 Err(_) if sent_item.is_none() => continue,
 
                 // There was a leak and a new sent item arrived while we were
-                // working. We have an item, so there's nothing we can do. We
-                // don't have to wake the sender yet, because it would have
-                // woken the receiver, so we'll definitely be polled again
-                // imminently.
+                // working. We already got an item, so we have to leave the new
+                // one there until a subsequent `recv`.
                 Err(_) => {}
             }
 
@@ -363,6 +430,14 @@ impl<T> Stream for Receiver<T> {
                 Some(item) => Poll::Ready(Some(item)),
                 None => Poll::Pending,
             };
+        };
+
+        match try_recv() {
+            Poll::Ready(item) => Poll::Ready(item),
+            Poll::Pending => {
+                lock.receiver_waker.register(cx.waker());
+                try_recv()
+            }
         }
     }
 
@@ -386,13 +461,13 @@ impl<T> Drop for Receiver<T> {
     }
 }
 
-/// Future type for the [`Receiver::recv`] operation. See its documentation for
-/// details.
-pub struct Recv<'a, T> {
+/// Future type for receiving a single item from a [`Receiver`]. Created by the
+/// [`recv`][Receiver::recv] method; see its documentation for details.
+pub struct RecvFut<'a, T> {
     receiver: &'a mut Receiver<T>,
 }
 
-impl<T> Debug for Recv<'_, T> {
+impl<T> Debug for RecvFut<'_, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Recv")
             .field("receiver", &self.receiver)
@@ -400,7 +475,7 @@ impl<T> Debug for Recv<'_, T> {
     }
 }
 
-impl<T> Future for Recv<'_, T> {
+impl<T> Future for RecvFut<'_, T> {
     type Output = Option<T>;
 
     #[inline]
@@ -409,22 +484,24 @@ impl<T> Future for Recv<'_, T> {
     }
 }
 
-impl<T> Drop for Recv<'_, T> {
+impl<T> Drop for RecvFut<'_, T> {
+    #[inline]
     fn drop(&mut self) {
         let Some(lock) = self.receiver.inner.lock() else { return };
         drop(lock.receiver_waker.take())
     }
 }
 
-#[derive(Error, Clone, Copy)]
+/// An error from a [`send()`][Sender::send] operation.
+///
+/// This error means the send failed due to a disconnect; this is the only way
+/// sends can fail. The error contains the item that failed to send.
+#[derive(Error, Clone, Debug, Copy)]
 #[error("tried to send on a disconnected channel")]
-pub struct SendError<T>(pub T);
-
-impl<T> Debug for SendError<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SendError(..)")
-    }
-}
+pub struct SendError<T>(
+    /// The item that failed to send
+    pub T,
+);
 
 #[cfg(test)]
 mod tests {
@@ -489,13 +566,14 @@ mod tests {
     fn sync_test() {
         let (mut sender, mut receiver) = channel();
 
-        let sender_thread = thread::spawn(move || {
-            futures::executor::block_on(async move {
+        let sender_thread = thread::Builder::new()
+            .name("sender thread".to_owned())
+            .spawn(move || {
                 for i in 0..1_000 {
-                    sender.send(i).await.unwrap();
+                    futures::executor::block_on(sender.send(i)).unwrap();
                 }
             })
-        });
+            .expect("failed to spawn thread");
 
         for i in 0..1_000 {
             assert_eq!(futures::executor::block_on(receiver.next()).unwrap(), i);
