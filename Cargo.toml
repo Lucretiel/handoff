@@ -7,7 +7,7 @@ authors = ["Nathan West <Lucretiel@gmail.com>"]
 readme = "README.md"
 license = "MPL-2.0"
 description = "An unbuffered, asynchronous, single-producer/single-consumer channel"
-repository = "https://github.com/Lucretiel/twinsies"
+repository = "https://github.com/Lucretiel/handoff"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
