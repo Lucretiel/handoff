@@ -1,18 +1,18 @@
 /*!
 `handoff` is a single-producer / single-consumer, unbuffered, asynchronous
-channel. It's intended for cases where you want blocking communication between
-two async components, where all sends block until the receiver receives the
-item.
+channel. It's intended for cases where you want blocking communication
+between two async components, where all sends block until the receiver
+receives the item.
 
 A new channel is created with [`channel`], which returns a [`Sender`] and
 [`Receiver`]. Items can be sent into the channel with [`Sender::send`], and
 received with [`Receiver::recv`]. [`Receiver`] also implements
-[`futures::Stream`]. Either end of the channel can be dropped, which will cause
-the other end to unblock and report channel disconnection.
+[`futures::Stream`]. Either end of the channel can be dropped, which will
+cause the other end to unblock and report channel disconnection.
 
 While the channel operates asynchronously, it can also be used in a fully
-synchronous way by using [`futures::block_on`] or similar utilities provided
-in most async runtimes.
+synchronous way by using [`block_on`][futures::block_on] or similar
+utilities provided in most async runtimes.
 
 # Examples
 
@@ -102,7 +102,6 @@ let recv_task = async move {
 let ((), ()) = join(send_task, recv_task).await;
 # });
 ```
-
 */
 
 #![deny(missing_docs)]
