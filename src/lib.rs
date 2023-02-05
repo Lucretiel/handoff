@@ -133,7 +133,7 @@ impl<T> UnsafeCellExt<T> for UnsafeCell<T> {
     }
 }
 
-use ::futures::{stream::FusedStream, task::AtomicWaker, Stream, StreamExt};
+use futures_util::{stream::FusedStream, task::AtomicWaker, Stream, StreamExt};
 use pin_project::{pin_project, pinned_drop};
 use pinned_aliasable::Aliasable;
 use thiserror::Error;
