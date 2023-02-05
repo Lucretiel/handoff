@@ -238,11 +238,11 @@ pub struct Sender<T> {
 }
 
 impl<T> Sender<T> {
-    /// Asynchronously send an item to the receiver. This method will
-    /// asynchronously block until the receiver has received the item. If the
-    /// receiver has been dropped, or drops while the sender is trying to send,
-    /// this will return a [`SendError`] containing the item that failed to
-    /// send.
+    /// Asynchronously send an item to the receiver.
+    ///
+    /// This method will asynchronously block until the receiver has received
+    /// the item. If the receiver disconnects, this will instead return a
+    /// [`SendError`] containing the item that failed to send.
     #[inline]
     #[must_use]
     pub fn send(&mut self, item: T) -> SendFut<'_, T> {
@@ -423,8 +423,9 @@ pub struct Receiver<T> {
 impl<T> Receiver<T> {
     /// Attempt to receive the next item from the sender.
     ///
-    /// This method will block until the sender sends an item, or until it
-    /// drops.
+    /// This method will asynchronously block until the sender sends an item,
+    /// then return that item. Alternatively, if the sender disconnects, this
+    /// will return `None`.
     #[inline]
     pub fn recv(&mut self) -> RecvFut<'_, T> {
         RecvFut { receiver: self }
