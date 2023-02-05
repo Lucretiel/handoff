@@ -7,7 +7,7 @@ item.
 A new channel is created with [`channel`], which returns a [`Sender`] and
 [`Receiver`]. Items can be sent into the channel with [`Sender::send`], and
 received with [`Receiver::recv`]. [`Receiver`] also implements
-[`futures::Stream`]. Either end of the channel can be dropped, which will
+[`futures::Stream`][Stream]. Either end of the channel can be dropped, which will
 cause the other end to unblock and report channel disconnection.
 
 While the channel operates asynchronously, it can also be used in a fully
@@ -133,7 +133,10 @@ impl<T> UnsafeCellExt<T> for UnsafeCell<T> {
     }
 }
 
-use futures_util::{stream::FusedStream, task::AtomicWaker, Stream, StreamExt};
+use futures_util::{
+    stream::{FusedStream, Stream, StreamExt},
+    task::AtomicWaker,
+};
 use pin_project::{pin_project, pinned_drop};
 use pinned_aliasable::Aliasable;
 use thiserror::Error;
@@ -414,7 +417,7 @@ unsafe impl<T> Sync for SendFut<'_, T> {}
 /// documentation][crate] for details.
 ///
 /// [`Receiver`] only provides a simple [`recv`][Receiver::recv] method on its
-/// own, but it also implements [`futures::StreamExt`], which provides a number
+/// own, but it also implements [`futures::StreamExt`][StreamExt], which provides a number
 /// of additional helpful iterator-like methods.
 pub struct Receiver<T> {
     inner: Joint<Inner<T>>,
