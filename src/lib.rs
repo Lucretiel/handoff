@@ -1,13 +1,109 @@
-//! `handoff` is a single-producer / single-consumer, unbuffered, asynchronous
-//! channel. It's intended for cases where you want blocking communication
-//! between two async components, where all sends block until the receiver
-//! receives the item.
-//!
-//! A new channel is created with [`channel`], which returns a [`Sender`] and
-//! [`Receiver`]. Items can be sent into the channel with [`Sender::send`], and
-//! received with [`Receiver::recv`]. [`Receiver`] also implements
-//! [`futures::Stream`]. Either end of the channel can be dropped, which will
-//! cause the other end to unblock and report channel disconnection.
+/*!
+`handoff` is a single-producer / single-consumer, unbuffered, asynchronous
+channel. It's intended for cases where you want blocking communication between
+two async components, where all sends block until the receiver receives the
+item.
+
+A new channel is created with [`channel`], which returns a [`Sender`] and
+[`Receiver`]. Items can be sent into the channel with [`Sender::send`], and
+received with [`Receiver::recv`]. [`Receiver`] also implements
+[`futures::Stream`]. Either end of the channel can be dropped, which will cause
+the other end to unblock and report channel disconnection.
+
+While the channel operates asynchronously, it can also be used in a fully
+synchronous way by using [`futures::block_on`] or similar utilities provided
+in most async runtimes.
+
+# Examples
+
+## Basic example
+
+```rust
+# futures::executor::block_on(async move {
+use handoff::channel;
+use futures::future::join;
+
+let (mut sender, mut receiver) = channel();
+
+let send_task = async move {
+    for i in 0..100 {
+        sender.send(i).await.expect("channel disconnected");
+    }
+};
+
+let recv_task = async move {
+    for i in 0..100 {
+        let value = receiver.recv().await.expect("channel disconnected");
+        assert_eq!(value, i);
+    }
+};
+
+// All sends block until the receiver accepts the value, so we need to make
+// sure the tasks happen concurrently
+let ((), ()) = join(send_task, recv_task).await;
+# });
+```
+
+## Synchronous use
+
+```
+use std::thread;
+use handoff::channel;
+use futures::executor::block_on;
+
+let (mut sender, mut receiver) = channel();
+
+let sender_thread = thread::Builder::new()
+    .name("sender thread".to_owned())
+    .spawn(move || {
+        for i in 0..100 {
+            block_on(sender.send(i)).expect("receiver disconnected");
+        }
+    })
+    .expect("failed to spawn sender thread");
+
+let receiver_thread = thread::spawn(move || {
+        for i in 0..100 {
+            let value = block_on(receiver.recv()).expect("sender disconnected");
+            assert_eq!(value, i);
+        }
+    });
+
+sender_thread.join().expect("sender panicked");
+receiver_thread.join().expect("receiver panicked");
+```
+
+## Disconnect
+
+```
+# futures::executor::block_on(async move {
+use handoff::channel;
+use futures::future::join;
+
+let (mut sender, mut receiver) = channel();
+
+let send_task = async move {
+    for i in 0..50 {
+        sender.send(i).await.expect("channel disconnected");
+    }
+};
+
+let recv_task = async move {
+    for i in 0..50 {
+        let value = receiver.recv().await.expect("channel disconnected");
+        assert_eq!(value, i);
+    }
+
+    assert!(receiver.recv().await.is_none());
+};
+
+// All sends block until the receiver accepts the value, so we need to make
+// sure the tasks happen concurrently
+let ((), ()) = join(send_task, recv_task).await;
+# });
+```
+
+*/
 
 #![deny(missing_docs)]
 #![deny(missing_debug_implementations)]
@@ -58,17 +154,6 @@ macro_rules! debug_unreachable {
     }
 }
 
-/// Literally the same as `if`, but fits more easily on one line
-macro_rules! when {
-    ($condition:expr, $t:expr, $f:expr) => {
-        if $condition {
-            $t
-        } else {
-            $f
-        }
-    };
-}
-
 /// Create an unbuffered channel for communicating between a pair of
 /// asynchronous components. All sends over this channel will block until the
 /// receiver receives the sent item. See [crate documentation][crate] for
@@ -104,7 +189,7 @@ impl<T> Inner<T> {
     /// The sender uses this to take an item pointer that it placed there, to
     /// regain exclusive access to its item.
     #[inline]
-    pub fn reclaim_sent_item_pointer(&self, item_pointer: NonNull<Option<T>>) {
+    fn reclaim_sent_item_pointer(&self, item_pointer: NonNull<Option<T>>) {
         loop {
             match self.sent_item.compare_exchange_weak(
                 item_pointer.as_ptr(),
@@ -271,15 +356,12 @@ impl<T> Future for SendFut<'_, T> {
         // happens if we leaked a `send` future, so we can just clobber it.
         // Similarly, we can theoretically not have the item, if we're polled
         // again after returning Ready. Neither of these cause unsoundness.
-
-        lock.sender_waker.register(cx.waker());
         debug_assert!(
             unsafe { item_pointer.as_ref() }.is_some(),
             "Don't poll futures after they returned success"
         );
-        // TODO: we technically only need a Release write the *first* time the
-        // item is stored, I think. It's likely that this won't make any
-        // practical performance difference, though.
+
+        lock.sender_waker.register(cx.waker());
         lock.sent_item.store(item_pointer.as_ptr(), Release);
         lock.receiver_waker.wake();
         *this.item_lent = true;
@@ -311,10 +393,11 @@ impl<T> PinnedDrop for SendFut<'_, T> {
         // new send future appears.
         drop(lock.sender_waker.take());
 
+        let item_pointer = this.item.into_ref().get().get_non_null();
+
         // Okay, we need to acquire the pointer before we can drop. This
         // might involve spinning if the receiver is working with it
         // right now.
-        let item_pointer = this.item.into_ref().get().get_non_null();
         lock.reclaim_sent_item_pointer(item_pointer);
         // Now that we've reclaimed the pointer, we don't need to do
         // anything else. The drop can proceed normally.
@@ -374,6 +457,8 @@ impl<T> Stream for Receiver<T> {
         // registering the waker. This avoids a race where we fail to retrieve
         // and item, then the sender places an item, then the sender calls
         // wake() before we've registered our waker.
+        //
+        // TODO: bench {recv; register(waker); recv} against {register(waker); recv}
 
         let try_recv = || loop {
             // Acquire the pointer. As long as we have it, we have exclusive
@@ -402,7 +487,7 @@ impl<T> Stream for Receiver<T> {
             match lock.sent_item.compare_exchange(
                 ptr::null_mut(),
                 sent_item_ptr.as_ptr(),
-                when!(sent_item.is_some(), Release, Relaxed),
+                Release,
                 Relaxed,
             ) {
                 // We restored the pointer, so we need to wake the sender so it
@@ -454,6 +539,9 @@ impl<T> FusedStream for Receiver<T> {
     }
 }
 
+// TODO: this drop is only necessary if the receiver has been acting as a
+// `futures::Stream`. Consider creating a separate wrapper around it that
+// implements stream.
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         let Some(lock) = self.inner.lock() else { return };
@@ -508,7 +596,7 @@ mod tests {
     use std::thread;
 
     use cool_asserts::assert_matches;
-    use futures::StreamExt;
+    use futures::{executor::block_on, StreamExt};
 
     use super::{channel, SendError};
 
@@ -569,17 +657,40 @@ mod tests {
         let sender_thread = thread::Builder::new()
             .name("sender thread".to_owned())
             .spawn(move || {
-                for i in 0..1_000 {
-                    futures::executor::block_on(sender.send(i)).unwrap();
-                }
+                block_on(async move {
+                    for i in 0..1_000 {
+                        sender.send(i).await.unwrap();
+                    }
+                })
             })
             .expect("failed to spawn thread");
 
         for i in 0..1_000 {
-            assert_eq!(futures::executor::block_on(receiver.next()).unwrap(), i);
+            assert_eq!(block_on(receiver.next()).unwrap(), i);
         }
 
         sender_thread.join().unwrap();
+    }
+
+    #[test]
+    fn sync_test_two_threads() {
+        let (mut sender, mut receiver) = channel();
+
+        let sender_thread = thread::spawn(move || {
+            for i in 0..100 {
+                block_on(sender.send(i)).expect("receiver disconnected");
+            }
+        });
+
+        let receiver_thread = thread::spawn(move || {
+            for i in 0..100 {
+                let value = block_on(receiver.recv()).expect("sender disconnected");
+                assert_eq!(value, i);
+            }
+        });
+
+        sender_thread.join().expect("sender panicked");
+        receiver_thread.join().expect("receiver panicked");
     }
 
     #[tokio::test]
